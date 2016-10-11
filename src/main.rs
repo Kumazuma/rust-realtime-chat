@@ -1,5 +1,6 @@
 extern crate chrono;
 extern crate num_cpus;
+#[macro_use(object)]
 extern crate json;
 use std::net::{TcpListener, TcpStream};
 use std::thread;
@@ -10,7 +11,7 @@ use std::collections::LinkedList;
 use chrono::datetime::DateTime;
 use std::sync::Mutex;
 use std::time::Duration;
-use std::io::{Error, ErrorKind,Read};
+use std::io::{Error, ErrorKind,Read,Write};
 use std::io;
 use std::collections::BTreeMap;
 enum CommandType
@@ -29,6 +30,12 @@ struct ChatMessage
     uid:u64,
     room:String,
     message_type:ChatMessageType
+}
+enum EventMessage
+{
+    SendSocketRemove{uid:u64},//송신소켓이 에러가 나서 리스트에서 제거해야 한다.
+    RecvSocketRemove{uid:u64},//수신소켓이 에러가 나서 리스트에서 제거해야 한다.
+    RecvChatMesage{msg:ChatMessage}
 }
 impl ChatMessage
 {
@@ -101,9 +108,12 @@ impl StreamItem
             buffer:Vec::new()
         }
     }
+    fn get_uid(&self)->u64
+    {
+        return self.uid;
+    }
     fn read_message(&mut self)->Result<ChatMessage,bool>
     {
-        let mut message_bytes:Vec<u8> = Vec::new();
         let mut read_bytes = [0u8; 1024];
         let res_code = self.socket.read(&mut read_bytes);
         
@@ -250,14 +260,41 @@ fn push_in_queue(queue:Arc<Mutex<LinkedList<StreamItem>>>, stream:StreamItem)
         }
     };
 }
-
+struct SendSocket
+{
+    uid:u64,
+    socket:TcpStream
+}
+impl SendSocket
+{
+    fn new(uid:u64, socket:TcpStream)->SendSocket
+    {
+        SendSocket
+        {
+            uid:uid,
+            socket:socket
+        }
+    }
+    fn send_message(&mut self, bytes:&[u8])->bool
+    {
+        return match self.socket.write_all(bytes)
+        {
+            Ok(_)=>true,
+            Err(_)=>false
+        };
+    }
+    fn get_uid(&self)->u64
+    {
+        return self.uid;
+    }
+}
 //이 함수는 수신 처리를 합니다.
-fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMessage>, user_id_manager:Arc<Mutex<UserIndexManager>>)
+fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<EventMessage>, user_id_manager:Arc<Mutex<UserIndexManager>>)
 {
     let mut socket_queue:Arc<Mutex<LinkedList<StreamItem>>> =Arc::new(Mutex::new(LinkedList::new())) ;
     for _ in 0..(num_cpus::get() * 2)
     {
-        let mut socket_queue = socket_queue.clone();
+        let socket_queue = socket_queue.clone();
         let ch_message_sender = ch_message_sender.clone();
         
         thread::spawn(move||
@@ -287,11 +324,20 @@ fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMe
                     Ok(message)=>
                     {
                         //TODO:메시지를 받았으니 이것을 다른 유저에게 전송할 수 있도록 하자
+                        ch_message_sender.send(EventMessage::RecvChatMesage{msg:message});
                     },
-                    Err(is_exception)=>if is_exception == false
+                    Err(is_exception)=>
                     {
-                        push_in_queue(socket_queue.clone(),stream);
+                        if is_exception == false
+                        {
+                            push_in_queue(socket_queue.clone(),stream);
+                        }
+                        else
+                        {
+                            ch_message_sender.send(EventMessage::RecvSocketRemove{uid:stream.get_uid()});
+                        }
                     }
+                    
                 }
             }
         });
@@ -304,7 +350,7 @@ fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMe
             let mut stream = stream;
             let ip = ip;
             let mut socket_queue = socket_queue.clone();
-            let mut user_id_manager =user_id_manager.clone();
+            let user_id_manager =user_id_manager.clone();
             thread::spawn(move||
             {
                 let mut read_bytes = [0u8;1024];
@@ -362,9 +408,9 @@ fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMe
 fn main()
 {
     let mut uid_manager  = Arc::new(Mutex::new(UserIndexManager::new()));
-    let mut rooms = Arc::new(Mutex::new(BTreeMap::<String, Room>::new()));
-    let mut chat_send_sockets = Arc::new(Mutex::new(BTreeMap::<u64,Arc<Mutex<TcpStream>>>::new()));
-    let mut user_names = Arc::new(Mutex::new(BTreeMap::<u64,String>::new()));
+    let mut rooms = BTreeMap::<String, Room>::new();
+    let mut chat_send_sockets =BTreeMap::<u64,Arc<Mutex<SendSocket>>>::new();
+    let mut user_names = BTreeMap::<u64,String>::new();
 
     let recv_listener = match TcpListener::bind("0.0.0.0:2016")
     {
@@ -385,7 +431,7 @@ fn main()
         }
     };
 
-    let (ch_send_to_main,ch_recv_in_main) = channel::<ChatMessage>();
+    let (ch_send_to_main,ch_recv_in_main) = channel::<EventMessage>();
     {
         let recv_listener = recv_listener;
 
@@ -401,11 +447,20 @@ fn main()
     {
         if let Ok(msg) = ch_recv_in_main.recv()
         {
-            let mut user_ids =
-            match rooms.lock()
+            match msg
             {
-                Ok(rooms)=>
+                EventMessage::RecvSocketRemove{uid}|EventMessage::SendSocketRemove{uid}=>
                 {
+                    if let Ok(mut uid_manager)= uid_manager.lock()
+                    {
+                        uid_manager.remove_user_id(uid);
+                    }
+                    chat_send_sockets.remove(&uid);
+                    user_names.remove(&uid);
+                }
+                EventMessage::RecvChatMesage{msg}=>
+                {
+                    let user_ids =
                     if let Some(ref item) = rooms.get(&msg.room)
                     {
                         item.entered_user_uids.clone()
@@ -413,70 +468,95 @@ fn main()
                     else
                     {
                         continue;
-                    }
-                },
-                Err(_)=>
-                {
-                    println!("에러 발생! mutex에러");
-                    return;
-                }
-            };
-            let mut sockets = Vec::<Arc<Mutex<TcpStream>>>::new();
-            if let Ok(chat_send_sockets) = chat_send_sockets.lock()
-            {
-                for uid in &user_ids
-                {
-                    if let Some(item) = chat_send_sockets.get(&uid)
+                    };
+                    let mut sockets = Vec::<Arc<Mutex<SendSocket>>>::new();
+                    for uid in &user_ids
                     {
-                        sockets.push(item.clone());
-                    }
-                    else if let Ok(mut rooms) = rooms.lock()
-                    {
-                        let mut index = None;
-                        if let Some(mut room) = rooms.get_mut(&msg.room)
+                        if let Some(item) = chat_send_sockets.get(&uid)
                         {
-                            
-                            for i in 0 .. room.entered_user_uids.len()
+                            sockets.push(item.clone());
+                        }
+                        else
+                        {
+                            let mut index = None;
+                            if let Some(mut room) = rooms.get_mut(&msg.room)
                             {
-                                if let Some(value) = room.entered_user_uids.get(i)
+                                for i in 0 .. room.entered_user_uids.len()
                                 {
-                                    if value == uid
+                                    if let Some(value) = room.entered_user_uids.get(i)
                                     {
-                                        index = Some(i);
-                                        break;
+                                        if value == uid
+                                        {
+                                            index = Some(i);
+                                            break;
+                                        }
                                     }
                                 }
-                            }
-                            if let Some(idx) = index
-                            {
-                                room.entered_user_uids.swap_remove(idx);
+                                if let Some(idx) = index
+                                {
+                                    room.entered_user_uids.swap_remove(idx);
+                                }
                             }
                         }
                     }
-                }
-            }
-            else
-            {
-                return;
-            }
-            let msg = Arc::new(msg);
-            for item in sockets
-            {
-                let mut socket = item.clone();
-                let msg = msg.clone();
-                let mut chat_send_sockets = chat_send_sockets.clone();
-                let mut uid_manager = uid_manager.clone();
-                thread::spawn(move||
-                {
-                    let socket = socket.lock();
-                    if let Err(_) = socket
+                    let msg = Arc::new(msg);
+                    
+                    for item in sockets
                     {
-                        return;
+                        let socket = item.clone();
+                        let msg = msg.clone();
+                        let ch_send_to_main = ch_send_to_main.clone();
+                        let name = if let Some(v) = user_names.get(&msg.uid)
+                        {
+                            v.clone()
+                        }
+                        else
+                        {
+                            continue;
+                        };
+                        thread::spawn(move||
+                        {
+                            let socket = socket.lock();
+                            if let Err(_) = socket
+                            {
+                                return;
+                            }
+                            let mut socket = socket.unwrap();
+
+                            let json_object = match msg.message_type
+                            {
+                                ChatMessageType::Text{ref text}=>
+                                {
+                                    object!
+                                    {
+                                        "sender"=>name.clone(),
+                                        "text"=>text.clone(),
+                                        "time"=>"",
+                                        "room"=>""
+                                    }
+                                }
+                                _=>
+                                {
+                                    object!
+                                    {
+                                        "sender"=>name.clone(),
+                                        "text"=>"",
+                                        "time"=>"",
+                                        "room"=>""
+                                    }
+                                }
+                            };
+                            let send_message = json::stringify(json_object);
+                            let message_bytes = send_message.into_bytes();
+                            if socket.send_message(&message_bytes) == false
+                            {
+                                ch_send_to_main.send(EventMessage::SendSocketRemove{uid:socket.get_uid()});
+                            }
+                            //TODO:Write Routine.
+                            //if socket is closed, remove it in socket tree and remove uid in uid manager 
+                        });
                     }
-                    let mut socket = socket.unwrap();
-                    //TODO:Write Routine.
-                    //if socket is closed, remove it in socket tree and remove uid in uid manager 
-                });
+                }
             }
         }
         else
