@@ -13,26 +13,30 @@ use std::time::Duration;
 use std::io::{Error, ErrorKind,Read};
 use std::io;
 use std::collections::BTreeMap;
+enum CommandType
+{
+    ChangeName{new_name:String}
+}
 enum ChatMessageType
 {
     Text{text:String},
     File{bytes:Arc<Vec<u8>>},
     Image{bytes:Arc<Vec<u8>>},
-    Command{cmd:String}
+    Command{c_type:CommandType}
 }
 struct ChatMessage
 {
-    sender:String,
+    uid:u64,
     room:String,
     message_type:ChatMessageType
 }
 impl ChatMessage
 {
-    fn new(sender:String, room:String, message_type:ChatMessageType)->ChatMessage
+    fn new(uid:u64, room:String, message_type:ChatMessageType)->ChatMessage
     {
         ChatMessage
         {
-            sender:sender,
+            uid:uid,
             room:room,
             message_type:message_type
         }
@@ -78,21 +82,21 @@ impl UserIndexManager
 
 struct Room
 {
-    entered_user_uids:Vec<u64>
+    entered_user_uids: Vec<u64>
 }
 struct StreamItem
 {
-    name : String,
+    uid : u64,
     socket : TcpStream,
     buffer : Vec<u8>
 }
 impl StreamItem
 {
-    fn new(sock : TcpStream)->StreamItem
+    fn new(sock : TcpStream, uid:u64)->StreamItem
     {
         StreamItem
         {
-            name:String::new(),
+            uid:uid,
             socket:sock,
             buffer:Vec::new()
         }
@@ -223,13 +227,12 @@ impl StreamItem
             "FILE"=>ChatMessageType::File{bytes:Arc::new(Vec::new())},
             "CHANGE NAME"=>
             {
-                self.name = text;
-                ChatMessageType::Command{cmd:"change name".to_string()}
+                ChatMessageType::Command{c_type:CommandType::ChangeName{new_name:text}}
             },
             _=>{return Err(());}
         };
         //TODO:여기서 메시지를 조립하여 반환한다.
-        return Ok(ChatMessage::new(self.name.clone(), room, chat_type));
+        return Ok(ChatMessage::new(self.uid, room, chat_type));
     }
 }
 
@@ -249,13 +252,14 @@ fn push_in_queue(queue:Arc<Mutex<LinkedList<StreamItem>>>, stream:StreamItem)
 }
 
 //이 함수는 수신 처리를 합니다.
-fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMessage>, user_index_manager:Arc<Mutex<UserIndexManager>>)
+fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMessage>, user_id_manager:Arc<Mutex<UserIndexManager>>)
 {
     let mut socket_queue:Arc<Mutex<LinkedList<StreamItem>>> =Arc::new(Mutex::new(LinkedList::new())) ;
     for _ in 0..(num_cpus::get() * 2)
     {
         let mut socket_queue = socket_queue.clone();
         let ch_message_sender = ch_message_sender.clone();
+        
         thread::spawn(move||
         {
             loop
@@ -300,6 +304,7 @@ fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMe
             let mut stream = stream;
             let ip = ip;
             let mut socket_queue = socket_queue.clone();
+            let mut user_id_manager =user_id_manager.clone();
             thread::spawn(move||
             {
                 let mut read_bytes = [0u8;1024];
@@ -339,7 +344,10 @@ fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMe
                 {
                     Ok(mut queue)=>
                     {
-                        queue.push_back(StreamItem::new(stream));
+                        if let Ok(mut user_id_manager) = user_id_manager.lock()
+                        {
+                            queue.push_back(StreamItem::new(stream, user_id_manager.get_new_id()));
+                        }
                     },
                     Err(_)=>
                     {
@@ -353,9 +361,11 @@ fn process_recv_socket(recv_listener:TcpListener,ch_message_sender:Sender<ChatMe
 
 fn main()
 {
-    let mut user_idx_manager  = Arc::new(Mutex::new(UserIndexManager::new()));
+    let mut uid_manager  = Arc::new(Mutex::new(UserIndexManager::new()));
     let mut rooms = Arc::new(Mutex::new(BTreeMap::<String, Room>::new()));
     let mut chat_send_sockets = Arc::new(Mutex::new(BTreeMap::<u64,Arc<Mutex<TcpStream>>>::new()));
+    let mut user_names = Arc::new(Mutex::new(BTreeMap::<u64,String>::new()));
+
     let recv_listener = match TcpListener::bind("0.0.0.0:2016")
     {
         Ok(v)=>v,
@@ -379,11 +389,11 @@ fn main()
     {
         let recv_listener = recv_listener;
 
-        let user_idx_manager = user_idx_manager.clone();
+        let uid_manager = uid_manager.clone();
         let sender = ch_send_to_main.clone();
         thread::spawn(move||
         {
-            process_recv_socket(recv_listener,sender, user_idx_manager);
+            process_recv_socket(recv_listener,sender, uid_manager);
         });
     }
 
@@ -420,6 +430,29 @@ fn main()
                     {
                         sockets.push(item.clone());
                     }
+                    else if let Ok(mut rooms) = rooms.lock()
+                    {
+                        let mut index = None;
+                        if let Some(mut room) = rooms.get_mut(&msg.room)
+                        {
+                            
+                            for i in 0 .. room.entered_user_uids.len()
+                            {
+                                if let Some(value) = room.entered_user_uids.get(i)
+                                {
+                                    if value == uid
+                                    {
+                                        index = Some(i);
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(idx) = index
+                            {
+                                room.entered_user_uids.swap_remove(idx);
+                            }
+                        }
+                    }
                 }
             }
             else
@@ -431,6 +464,8 @@ fn main()
             {
                 let mut socket = item.clone();
                 let msg = msg.clone();
+                let mut chat_send_sockets = chat_send_sockets.clone();
+                let mut uid_manager = uid_manager.clone();
                 thread::spawn(move||
                 {
                     let socket = socket.lock();
@@ -439,6 +474,8 @@ fn main()
                         return;
                     }
                     let mut socket = socket.unwrap();
+                    //TODO:Write Routine.
+                    //if socket is closed, remove it in socket tree and remove uid in uid manager 
                 });
             }
         }
