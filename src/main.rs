@@ -48,6 +48,10 @@ enum EventMessage {
     ConnectedSendSocket{
         socket:TcpStream
     },
+    GetIdentifyHash{
+    	socket:TcpStream,
+    	identify_hash:String
+    },
     SendSocketRemove {
         uid: u64,
     }, // 송신소켓이 에러가 나서 리스트에서 제거해야 한다.
@@ -378,12 +382,16 @@ fn process_recv_socket(recv_listener: TcpListener,
                 }else{
                     return;
                 };
+                if let Err(_) = stream.write_all(&return_handshake_json_byte)
+                {
+                	return;
+                }
                 ch_message_sender.send(EventMessage::ConnectedRecvSocket{
                     uid:uid,
                     identify_hash:hashing,
                     init_name:name
-                });
-                stream.write_all(&return_handshake_json_byte);
+                }).unwrap();
+                
                 // 핸드셰이크를 완료한 후, 문제가 없으면 큐에 넣는다.
                 match socket_queue.lock() {
                     Ok(mut queue) => {
@@ -448,9 +456,45 @@ fn main() {
     loop {
         if let Ok(msg) = ch_recv_in_main.recv() {
             match msg {
+            	EventMessage::GetIdentifyHash{socket, identify_hash}=>{
+	            	if let Some(uid) = identify_hashs.get(&identify_hash){
+	            		chat_send_sockets.insert(*uid,Arc::new(Mutex::new(SendSocket::new(*uid, socket) )));
+	            	}
+	            	else{
+	            		return;
+	            	}
+            	},
                 EventMessage::ConnectedSendSocket{socket}=>{
+                    let mut socket:TcpStream = socket;
+                    let sender = ch_send_to_main.clone();
                     thread::spawn(move||{
                         //GET INDENTIFY HASH
+                        let mut bytes = [0u8,1024];
+                        let mut buffer = Vec::<u8>::new();
+                        'read_loop:loop
+                        {
+	                        let read_bytes_size = socket.read(&mut bytes);
+	                        if let Err( _ ) = read_bytes_size{
+		                        return;
+	                        }
+	                        let read_bytes_size:usize = read_bytes_size.unwrap();
+	                        for i in 0..read_bytes_size{
+	                        	if bytes[i] != b'\n'{
+	                        		buffer.push(bytes[i]);
+	                        	}
+	                        	else{
+	                        		break'read_loop;
+	                        	}
+	                        }
+	                        
+                        }
+                        let hash = String::from_utf8(buffer);
+                        if let Err(_) = hash{
+                        	return;
+                        }
+                        let hash = hash.unwrap();
+                        sender.send(EventMessage::GetIdentifyHash{socket:socket,identify_hash:hash});
+                        
                     });
                 },
                 EventMessage::ConnectedRecvSocket{uid, identify_hash, init_name}=>{
@@ -469,6 +513,10 @@ fn main() {
                     user_names.remove(&uid);
                 }
                 EventMessage::RecvChatMesage { msg } => {
+                	if let None =  chat_send_sockets.get(&msg.uid){
+                		ch_send_to_main.send(EventMessage::SendSocketRemove{uid:msg.uid}).unwrap();
+                		continue;
+                	}
                     let user_ids = if let Some(ref item) = rooms.get(&msg.room) {
                         item.entered_user_uids.clone()
                     } else {
@@ -496,7 +544,7 @@ fn main() {
                         }
                     }
                     let msg = Arc::new(msg);
-
+					
                     for item in sockets {
                         let socket = item.clone();
                         let msg = msg.clone();
@@ -507,9 +555,7 @@ fn main() {
                             continue;
                         };
                         thread::spawn(move || {
-
                             let socket = socket.lock();
-
                             if let Err(_) = socket {
                                 return;
                             }
@@ -521,7 +567,7 @@ fn main() {
                                     {
                                         "sender"=>name.clone(),
                                         "text"=>text.clone(),
-                                        "time"=>"",
+                                        "time"=>format("{}",UTC::new()),
                                         "room"=>msg.room.clone()
                                     }
                                 }
@@ -530,7 +576,7 @@ fn main() {
                                     {
                                         "sender"=>name.clone(),
                                         "text"=>"",
-                                        "time"=>"",
+                                        "time"=>format("{}",UTC::new()),
                                         "room"=>""
                                     }
                                 }
@@ -540,11 +586,13 @@ fn main() {
                             if socket.send_message(&message_bytes) == false {
                                 ch_send_to_main.send(EventMessage::SendSocketRemove{uid:socket.get_uid()});
                             }
+                            
                             // TODO:Write Routine.
                             // if socket is closed, remove it in socket tree and remove uid in uid manager
                         });
                     }
                 }
+                
             }
         } else {
             return;
