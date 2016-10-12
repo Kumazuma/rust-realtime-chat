@@ -88,6 +88,7 @@ impl UserIndexManager {
     }
 }
 
+
 struct Room {
     entered_user_uids: Vec<u64>,
 }
