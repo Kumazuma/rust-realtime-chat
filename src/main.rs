@@ -33,6 +33,14 @@ enum ChatMessageType {
     Command {
         c_type: CommandType,
     },
+    NewMemberGoInRoom{
+    	name:String,
+    	members:Vec<String>
+    },
+    MemberOutOnRoom{
+    	name:String,
+    	members:Vec<String>
+    }
 }
 struct ChatMessage {
     uid: u64,
@@ -127,6 +135,7 @@ impl StreamItem {
 
         if let Err(e) = res_code {
             let exception = ErrorKind::TimedOut != e.kind();
+            println!("{:?}",e.kind());
             return Err(exception);
         }
 
@@ -163,54 +172,63 @@ impl StreamItem {
         return Err(false);
     }
     fn parse_string(&mut self, message: String) -> Result<ChatMessage, ()> {
+    	println!("{} parsing try!",message);
         let json_message = match json::parse(&message) {
             Ok(v) => v,
             Err(_) => {
+            	println!("{} parsing error!",message);
                 return Err(());
             }
         };
-        // 받은 메시지는 {type:string,room:string, value:string}으로 이루어질 것이다. 아니면 잘못 보낸 것임.
+        // 받은 메시지는 {type:string,hash:string, room:string, value:string}으로 이루어질 것이다. 아니면 잘못 보낸 것임.
         let json_object = match json_message {
             json::JsonValue::Object(ref object) => object,
             _ => {
+            	println!("line 186 parsing error!");
                 return Err(());
             }
         };
         let type_string: String = match json_object.get("type") {
-            Some(v) => {
-                if let &json::JsonValue::String(ref type_string) = v {
-                    type_string.clone()
-                } else {
-                    return Err(());
-                }
-            }
+            Some(v) =>match v{
+            		&json::JsonValue::String(ref value)=>value.clone(),
+            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
+            		_=>{
+            			println!("line 196 parsing error!");
+	                    return Err(());
+            		}
+            	},
             None => {
+            	println!("line 200 parsing error!");
                 return Err(());
             }
         };
 
         let room: String = match json_object.get("room") {
-            Some(v) => {
-                if let &json::JsonValue::String(ref room_string) = v {
-                    room_string.clone()
-                } else {
-                    return Err(());
-                }
-            }
+            Some(v) =>match v{
+            		&json::JsonValue::String(ref value)=>value.clone(),
+            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
+            		_=>{
+            			println!("line 211 parsing error!");
+	                    return Err(());
+            		}
+            	},
             None => {
+            	println!("line 216 parsing error!");
                 return Err(());
             }
         };
 
         let text = match json_object.get("value") {
-            Some(v) => {
-                if let &json::JsonValue::String(ref text_string) = v {
-                    text_string.clone()
-                } else {
-                    return Err(());
-                }
-            }
+            Some(v) => match v{
+            		&json::JsonValue::String(ref value)=>value.clone(),
+            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
+            		_=>{
+            			println!("line 226 parsing error!");
+	                    return Err(());
+            		}
+            	},
             None => {
+            	println!("line 231 parsing error!");
                 return Err(());
             }
         };
@@ -218,10 +236,14 @@ impl StreamItem {
             "TEXT" => ChatMessageType::Text { text: text },
             "IMG" => ChatMessageType::Image { bytes: Arc::new(Vec::new()) },
             "FILE" => ChatMessageType::File { bytes: Arc::new(Vec::new()) },
-            "CHANGE NAME" => {
+			"EXIT" =>{
+				return Err(());
+			}
+            "CHANGE_NAME" => {
                 ChatMessageType::Command { c_type: CommandType::ChangeName { new_name: text } }
             }
             _ => {
+            	println!("line 244 parsing error!");
                 return Err(());
             }
         };
@@ -230,16 +252,6 @@ impl StreamItem {
     }
 }
 
-fn push_in_queue(queue: Arc<Mutex<LinkedList<StreamItem>>>, stream: StreamItem) {
-    match queue.lock() {
-        Ok(mut queue) => {
-            queue.push_back(stream);
-        }
-        Err(_) => {
-            println!("에러 발생! mutex에러");
-        }
-    };
-}
 struct SendSocket {
     uid: u64,
     socket: TcpStream,
@@ -253,7 +265,10 @@ impl SendSocket {
     }
     fn send_message(&mut self, bytes: &[u8]) -> bool {
         return match self.socket.write_all(bytes) {
-            Ok(_) => true,
+            Ok(_) => match self.socket.write_all(b"\n"){
+                Ok(_)=>true,
+                Err(_)=>false
+            },
             Err(_) => false,
         };
     }
@@ -265,39 +280,40 @@ impl SendSocket {
 fn process_recv_socket(recv_listener: TcpListener,
                        ch_message_sender: Sender<EventMessage>,
                        user_id_manager: Arc<Mutex<UserIndexManager>>) {
-    let mut socket_queue: Arc<Mutex<LinkedList<StreamItem>>> =
-        Arc::new(Mutex::new(LinkedList::new()));
-    for _ in 0..(num_cpus::get() * 2) {
-        let socket_queue = socket_queue.clone();
+        
+    let (ch_send_to_main, ch_recv_in_main) = channel::<StreamItem>();
+	
+    let ch_recv_in_main = Arc::new(Mutex::new(ch_recv_in_main));
+    for _ in 0..(num_cpus::get()) {
         let ch_message_sender = ch_message_sender.clone();
-
+		let ch_send_to_main = ch_send_to_main.clone();
+		let ch_recv_in_main = ch_recv_in_main.clone(); 
         thread::spawn(move || {
             loop {
-                let mut stream = {
-                    let mut queue = match socket_queue.lock() {
-                        Ok(queue) => queue,
-                        Err(_) => {
-                            println!("에러 발생! mutex에러");
-                            continue;
-                        }
-                    };
-                    match queue.pop_front() {
-                        Some(v) => v,
-                        None => {
-                            continue;
-                        }
-                    }
-                };
+            	let mut stream = match ch_recv_in_main.lock(){
+            		Ok(v)=>match v.recv(){
+            			Ok(stream)=>stream,
+            			Err( _ )=>{
+            				continue;
+            			}
+            		},
+            		Err( _ ) =>{
+            			continue;
+            		}
+            	};
+            	
                 // 여기에 수신 처리 코드가 들어 간다.
                 match stream.read_message() {
                     Ok(message) => {
                         // TODO:메시지를 받았으니 이것을 다른 유저에게 전송할 수 있도록 하자
                         ch_message_sender.send(EventMessage::RecvChatMesage { msg: message });
+                        ch_send_to_main.send(stream);
                     }
                     Err(is_exception) => {
                         if is_exception == false {
-                            push_in_queue(socket_queue.clone(), stream);
+                        	ch_send_to_main.send(stream);
                         } else {
+                        	println!("out!");
                             ch_message_sender.send(EventMessage::RecvSocketRemove{uid:stream.get_uid()});
                         }
                     }
@@ -310,15 +326,17 @@ fn process_recv_socket(recv_listener: TcpListener,
         if let Ok((stream, ip)) = recv_listener.accept() {
             let mut stream = stream;
             let ip = ip;
-            let mut socket_queue = socket_queue.clone();
             let user_id_manager = user_id_manager.clone();
             let ch_message_sender = ch_message_sender.clone();
+            let ch_send_to_main = ch_send_to_main.clone();
             thread::spawn(move || {
                 let mut read_bytes = [0u8; 1024];
                 let mut buffer = Vec::<u8>::new();
                 let mut message_block_end = false;
                 let mut string_memory_block: Vec<u8> = Vec::new();
-                stream.set_read_timeout(Some(Duration::new(5, 0)));
+                stream.set_nodelay(true);
+                stream.set_read_timeout(Some(Duration::new(1, 0)));
+                stream.set_write_timeout(Some(Duration::new(1, 0)));
                 while message_block_end == false {
                     if let Ok(read_size) = stream.read(&mut read_bytes) {
                         for i in 0..read_size {
@@ -369,7 +387,7 @@ fn process_recv_socket(recv_listener: TcpListener,
                     let value = value.into_bytes();
                     crypto_hash::hex_digest(crypto_hash::Algorithm::SHA512, value)
                 };
-                let return_handshake_json_byte =
+                let mut return_handshake_json_byte =
                 json::stringify(object!
                 {
                     "status"=>200,
@@ -377,6 +395,7 @@ fn process_recv_socket(recv_listener: TcpListener,
                     "name"=>name.clone(),
                     "room"=>"lounge"
                 }).into_bytes();
+                return_handshake_json_byte.push(b'\n');
                 let uid = if let Ok(mut user_id_manager) = user_id_manager.lock() {
                     user_id_manager.get_new_id()
                 }else{
@@ -390,17 +409,12 @@ fn process_recv_socket(recv_listener: TcpListener,
                     uid:uid,
                     identify_hash:hashing,
                     init_name:name
-                }).unwrap();
-                
+                });
                 // 핸드셰이크를 완료한 후, 문제가 없으면 큐에 넣는다.
-                match socket_queue.lock() {
-                    Ok(mut queue) => {
-                        queue.push_back(StreamItem::new(stream, uid));
-                    }
-                    Err(_) => {
-                        println!("에러 발생! mutex에러");
-                    }
-                };
+                println!("try push in queue");
+                ch_send_to_main.send(StreamItem::new(stream, uid));
+                
+                
             });
         }
     }
@@ -414,9 +428,7 @@ fn main() {
     let mut user_names = BTreeMap::<u64, String>::new();
     let mut identify_hashs = BTreeMap::< String, u64>::new();
     rooms.insert("lounge".to_string(), Room{entered_user_uids:Vec::new()});
-
-
-
+    
     let recv_listener = match TcpListener::bind("0.0.0.0:2016") {
         Ok(v) => v,
         Err(_) => {
@@ -448,57 +460,94 @@ fn main() {
         thread::spawn(move || {
             for socket in send_listener.incoming()
             {
-                let socket = socket.unwrap();
-                sender.send(EventMessage::ConnectedSendSocket{socket:socket}).unwrap();
+            	if let Err(_) = socket{
+            		continue;
+            	} 
+                let mut socket = socket.unwrap();
+                let sender = sender.clone();
+                thread::spawn(move||{
+	                println!("come send socket");
+	                //GET INDENTIFY HASH
+	                let mut bytes = [0u8,1024];
+	                let mut buffer = Vec::<u8>::new();
+					socket.set_read_timeout(Some(Duration::new(1, 0)));
+	                'read_loop:loop
+	                {
+	                    let read_bytes_size = socket.read(&mut bytes);
+	                    if let Err( e ) = read_bytes_size{
+							println!("{}",e);
+							if let ErrorKind::TimedOut = e.kind(){
+								continue;
+							}
+	                        return;
+	                    }
+	                    let read_bytes_size:usize = read_bytes_size.unwrap();
+	                    for i in 0..read_bytes_size{
+	                    	if bytes[i] != b'\n'{
+	                    		buffer.push(bytes[i]);
+	                    	}
+	                    	else{
+	                    		println!("break'read_loop");
+	                    		break'read_loop;
+	                    	}
+	                    }
+	                }
+	                let hash = String::from_utf8(buffer);
+	                
+	                if let Err(_) = hash{
+	                	println!("error");
+	                	return;
+	                }
+	                let hash = hash.unwrap();
+	                println!("hash: {}",hash);
+	                sender.send(EventMessage::GetIdentifyHash{socket:socket,identify_hash:hash}).unwrap();
+                });
             }
         });
     }
     loop {
+    	
         if let Ok(msg) = ch_recv_in_main.recv() {
             match msg {
-            	EventMessage::GetIdentifyHash{socket, identify_hash}=>{
+            	EventMessage::GetIdentifyHash{mut socket, identify_hash}=>{
+	            	println!("get identify hash");
 	            	if let Some(uid) = identify_hashs.get(&identify_hash){
+	            		println!("correct!");
+	            		let bytes= identify_hash.clone();
+	            		let mut bytes = bytes.into_bytes();
+	            		bytes.push(b'\n');
+	            		
+	            		socket.write_all(&bytes).unwrap();   
 	            		chat_send_sockets.insert(*uid,Arc::new(Mutex::new(SendSocket::new(*uid, socket) )));
+	            		let mut members = Vec::<String>::new();
+	            		if let Some(room) = rooms.get("lounge"){
+	                        for uid in &room.entered_user_uids{
+	                        	if let Some(member_name) = user_names.get(&uid){
+	                        		members.push(member_name.clone());
+	                        	}
+	                        }
+	                    }
+						let name = match user_names.get(uid)
+						{
+							Some(v)=>v.clone(),
+							None=>{continue;}
+						};
+                        let chmsgtype = ChatMessageType::NewMemberGoInRoom
+                        {
+                        	name:name, members:members
+                        };
+                        ch_send_to_main.send(EventMessage::RecvChatMesage{msg:ChatMessage::new(*uid,"lounge".to_string(), chmsgtype)});
+	            		
 	            	}
 	            	else{
 	            		return;
 	            	}
             	},
                 EventMessage::ConnectedSendSocket{socket}=>{
-                    let mut socket:TcpStream = socket;
-                    let sender = ch_send_to_main.clone();
-                    thread::spawn(move||{
-                        //GET INDENTIFY HASH
-                        let mut bytes = [0u8,1024];
-                        let mut buffer = Vec::<u8>::new();
-                        'read_loop:loop
-                        {
-	                        let read_bytes_size = socket.read(&mut bytes);
-	                        if let Err( _ ) = read_bytes_size{
-		                        return;
-	                        }
-	                        let read_bytes_size:usize = read_bytes_size.unwrap();
-	                        for i in 0..read_bytes_size{
-	                        	if bytes[i] != b'\n'{
-	                        		buffer.push(bytes[i]);
-	                        	}
-	                        	else{
-	                        		break'read_loop;
-	                        	}
-	                        }
-	                        
-                        }
-                        let hash = String::from_utf8(buffer);
-                        if let Err(_) = hash{
-                        	return;
-                        }
-                        let hash = hash.unwrap();
-                        sender.send(EventMessage::GetIdentifyHash{socket:socket,identify_hash:hash});
-                        
-                    });
+
                 },
                 EventMessage::ConnectedRecvSocket{uid, identify_hash, init_name}=>{
-                    user_names.insert(uid, init_name);
+                    user_names.insert(uid, init_name.clone());
                     identify_hashs.insert(identify_hash,uid);
                     if let Some(mut room) = rooms.get_mut("lounge"){
                         room.entered_user_uids.push(uid);
@@ -506,17 +555,48 @@ fn main() {
                 },
                 EventMessage::RecvSocketRemove { uid } |
                 EventMessage::SendSocketRemove { uid } => {
+					println!("{} is disconnected sever",uid);
                     if let Ok(mut uid_manager) = uid_manager.lock() {
                         uid_manager.remove_user_id(uid);
+                    }
+                    for (key, ref mut room) in rooms.iter_mut(){
+                    	if room.entered_user_uids.contains(&uid){
+                    		let len = room.entered_user_uids.len();
+                    		let mut idx_in_room = None;
+                    		for i in 0usize..len{
+                    			if let  Some(v) = room.entered_user_uids.get(i){
+                    				if *v == uid{
+                    					idx_in_room = Some(i);
+                    					break;
+                    				}
+                    			}
+                    		}
+                    		if let Some(i) = idx_in_room{
+                    			room.entered_user_uids.swap_remove(i);
+                    		}
+                    		println!("{} is in {}",uid,key);
+                    		let mut members = Vec::<String>::new();
+	                        for uid in &room.entered_user_uids{
+	                        	if let Some(member_name) = user_names.get(&uid){
+	                        		members.push(member_name.clone());
+	                        	}
+	                        }
+	                        let name = match user_names.get(&uid)
+							{
+								Some(v)=>v.clone(),
+								None=>{continue;}
+							};
+                    		let chmsgtype = ChatMessageType::MemberOutOnRoom
+	                        {
+	                        	name:name, members:members
+	                        };
+                    		ch_send_to_main.send(EventMessage::RecvChatMesage{msg:ChatMessage::new(uid,key.clone(), chmsgtype)});
+                    	}
                     }
                     chat_send_sockets.remove(&uid);
                     user_names.remove(&uid);
                 }
                 EventMessage::RecvChatMesage { msg } => {
-                	if let None =  chat_send_sockets.get(&msg.uid){
-                		ch_send_to_main.send(EventMessage::SendSocketRemove{uid:msg.uid}).unwrap();
-                		continue;
-                	}
                     let user_ids = if let Some(ref item) = rooms.get(&msg.room) {
                         item.entered_user_uids.clone()
                     } else {
@@ -551,8 +631,11 @@ fn main() {
                         let ch_send_to_main = ch_send_to_main.clone();
                         let name = if let Some(v) = user_names.get(&msg.uid) {
                             v.clone()
-                        } else {
-                            continue;
+                        } else if let ChatMessageType::MemberOutOnRoom{ref name, ..} = msg.message_type{
+                            name.clone()
+                        }
+                        else{
+                        	continue;
                         };
                         thread::spawn(move || {
                             let socket = socket.lock();
@@ -565,34 +648,51 @@ fn main() {
                                 ChatMessageType::Text { ref text } => {
                                     object!
                                     {
+                                    	"type"=>"CHAT_SEND",
                                         "sender"=>name.clone(),
                                         "text"=>text.clone(),
-                                        "time"=>format("{}",UTC::new()),
+                                        "time"=>format!("{}",UTC::now()),
                                         "room"=>msg.room.clone()
                                     }
-                                }
+                                },
+                                ChatMessageType::NewMemberGoInRoom{ref name,ref members}=>{
+	                                object!
+	                                {
+	                                	"type"=>"NEW_MEMBER_COME_IN",
+	                                	"new member"=>name.clone(),
+	                                	"member list"=>members.clone(),
+	                                	"room"=>msg.room.clone()
+	                                }
+                                },
+                                ChatMessageType::MemberOutOnRoom{ref name,ref members}=>{
+	                                object!
+	                                {
+	                                	"type"=>"MEMBER_GET_OUT_ROOM",
+	                                	"member"=>name.clone(),
+	                                	"member list"=>members.clone(),
+	                                	"room"=>msg.room.clone()
+	                                }
+                                },
                                 _ => {
                                     object!
                                     {
                                         "sender"=>name.clone(),
                                         "text"=>"",
-                                        "time"=>format("{}",UTC::new()),
+                                        "time"=>format!("{}",UTC::now()),
                                         "room"=>""
                                     }
                                 }
                             };
                             let send_message = json::stringify(json_object);
+							println!("{}",send_message);
                             let message_bytes = send_message.into_bytes();
+                            // if socket is closed, remove it in socket tree and remove uid in uid manager
                             if socket.send_message(&message_bytes) == false {
                                 ch_send_to_main.send(EventMessage::SendSocketRemove{uid:socket.get_uid()});
                             }
-                            
-                            // TODO:Write Routine.
-                            // if socket is closed, remove it in socket tree and remove uid in uid manager
                         });
                     }
                 }
-                
             }
         } else {
             return;
