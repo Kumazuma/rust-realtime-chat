@@ -1,5 +1,6 @@
 extern crate chrono;
 extern crate num_cpus;
+extern crate crypto_hash;
 #[macro_use(object)]
 extern crate json;
 use std::net::{TcpListener, TcpStream};
@@ -39,6 +40,14 @@ struct ChatMessage {
     message_type: ChatMessageType,
 }
 enum EventMessage {
+    ConnectedRecvSocket{
+        uid: u64,
+        identify_hash: String ,
+        init_name:String
+    },
+    ConnectedSendSocket{
+        socket:TcpStream
+    },
     SendSocketRemove {
         uid: u64,
     }, // 송신소켓이 에러가 나서 리스트에서 제거해야 한다.
@@ -299,6 +308,7 @@ fn process_recv_socket(recv_listener: TcpListener,
             let ip = ip;
             let mut socket_queue = socket_queue.clone();
             let user_id_manager = user_id_manager.clone();
+            let ch_message_sender = ch_message_sender.clone();
             thread::spawn(move || {
                 let mut read_bytes = [0u8; 1024];
                 let mut buffer = Vec::<u8>::new();
@@ -321,13 +331,63 @@ fn process_recv_socket(recv_listener: TcpListener,
                     }
                 }
                 // TODO:처음 들어오는 내용은 HandShake헤더다.
-
+                let string_connected_first =
+                if let Ok(v) = String::from_utf8(string_memory_block){
+                    v
+                }else{
+                    return;
+                };
+                let json_value =
+                if let Ok(v) = json::parse(string_connected_first.as_str()){
+                    v
+                }else{
+                    return;
+                };
+                let json_value =
+                if let json::JsonValue::Object(object) = json_value{
+                    object
+                }else{
+                    return;
+                };
+                let name = 
+                if let Some(val) = json_value.get("name"){
+                    match val
+                    {
+                        &json::JsonValue::String(ref v)=>v.clone(),
+                        &json::JsonValue::Null=>format!("{}",stream.peer_addr().unwrap()),
+                        _=>{return;}
+                    }
+                }else{
+                    return;
+                };
+                let hashing = {
+                    let value = format!("{}-{}-{}",name,stream.peer_addr().unwrap(),UTC::now());
+                    let value = value.into_bytes();
+                    crypto_hash::hex_digest(crypto_hash::Algorithm::SHA512, value)
+                };
+                let return_handshake_json_byte =
+                json::stringify(object!
+                {
+                    "status"=>200,
+                    "id"=>hashing.clone(),
+                    "name"=>name.clone(),
+                    "room"=>"lounge"
+                }).into_bytes();
+                let uid = if let Ok(mut user_id_manager) = user_id_manager.lock() {
+                    user_id_manager.get_new_id()
+                }else{
+                    return;
+                };
+                ch_message_sender.send(EventMessage::ConnectedRecvSocket{
+                    uid:uid,
+                    identify_hash:hashing,
+                    init_name:name
+                });
+                stream.write_all(&return_handshake_json_byte);
                 // 핸드셰이크를 완료한 후, 문제가 없으면 큐에 넣는다.
                 match socket_queue.lock() {
                     Ok(mut queue) => {
-                        if let Ok(mut user_id_manager) = user_id_manager.lock() {
-                            queue.push_back(StreamItem::new(stream, user_id_manager.get_new_id()));
-                        }
+                        queue.push_back(StreamItem::new(stream, uid));
                     }
                     Err(_) => {
                         println!("에러 발생! mutex에러");
@@ -344,7 +404,8 @@ fn main() {
     let mut rooms = BTreeMap::<String, Room>::new();
     let mut chat_send_sockets = BTreeMap::<u64, Arc<Mutex<SendSocket>>>::new();
     let mut user_names = BTreeMap::<u64, String>::new();
-
+    let mut identify_hashs = BTreeMap::< String, u64>::new();
+    rooms.insert("lounge".to_string(), Room{entered_user_uids:Vec::new()});
 
 
 
@@ -373,10 +434,32 @@ fn main() {
             process_recv_socket(recv_listener, sender, uid_manager);
         });
     }
-
+    {
+        let send_listener = send_listener;
+        let sender = ch_send_to_main.clone();
+        thread::spawn(move || {
+            for socket in send_listener.incoming()
+            {
+                let socket = socket.unwrap();
+                sender.send(EventMessage::ConnectedSendSocket{socket:socket}).unwrap();
+            }
+        });
+    }
     loop {
         if let Ok(msg) = ch_recv_in_main.recv() {
             match msg {
+                EventMessage::ConnectedSendSocket{socket}=>{
+                    thread::spawn(move||{
+                        //GET INDENTIFY HASH
+                    });
+                },
+                EventMessage::ConnectedRecvSocket{uid, identify_hash, init_name}=>{
+                    user_names.insert(uid, init_name);
+                    identify_hashs.insert(identify_hash,uid);
+                    if let Some(mut room) = rooms.get_mut("lounge"){
+                        room.entered_user_uids.push(uid);
+                    }
+                },
                 EventMessage::RecvSocketRemove { uid } |
                 EventMessage::SendSocketRemove { uid } => {
                     if let Ok(mut uid_manager) = uid_manager.lock() {
@@ -439,7 +522,7 @@ fn main() {
                                         "sender"=>name.clone(),
                                         "text"=>text.clone(),
                                         "time"=>"",
-                                        "room"=>""
+                                        "room"=>msg.room.clone()
                                     }
                                 }
                                 _ => {
