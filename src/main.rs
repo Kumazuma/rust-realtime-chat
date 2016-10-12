@@ -53,9 +53,6 @@ enum EventMessage {
         identify_hash: String ,
         init_name:String
     },
-    ConnectedSendSocket{
-        socket:TcpStream
-    },
     GetIdentifyHash{
     	socket:TcpStream,
     	identify_hash:String
@@ -543,9 +540,6 @@ fn main() {
 	            		return;
 	            	}
             	},
-                EventMessage::ConnectedSendSocket{socket}=>{
-
-                },
                 EventMessage::ConnectedRecvSocket{uid, identify_hash, init_name}=>{
                     user_names.insert(uid, init_name.clone());
                     identify_hashs.insert(identify_hash,uid);
