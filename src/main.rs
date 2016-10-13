@@ -132,7 +132,20 @@ impl StreamItem {
         let res_code = self.socket.read(&mut read_bytes);
 
         if let Err(e) = res_code {
-            let exception = ErrorKind::TimedOut != e.kind();
+        	let exception = match e.kind(){
+        		ErrorKind::ConnectionRefused |
+				ErrorKind::ConnectionReset |
+				ErrorKind::ConnectionAborted |
+				ErrorKind::NotConnected |
+				ErrorKind::Other=>{
+        			true
+        		}
+        		_=>{
+        			println!("{}",e);
+        			false
+        		}
+        	};
+        	
             return Err(exception);
         }
 
@@ -386,6 +399,7 @@ fn process_recv_socket(recv_listener: TcpListener,
                     match val
                     {
                         &json::JsonValue::String(ref v)=>v.clone(),
+						&json::JsonValue::Short(value) =>value.as_str().to_string(),
                         &json::JsonValue::Null=>format!("{}",stream.peer_addr().unwrap()),
                         _=>{return;}
                     }
