@@ -22,6 +22,7 @@ enum CommandType {
 }
 enum ChatMessageType {
     Text {
+    	hash: String,
         text: String,
     },
     File {
@@ -132,7 +133,6 @@ impl StreamItem {
 
         if let Err(e) = res_code {
             let exception = ErrorKind::TimedOut != e.kind();
-            println!("{:?}",e.kind());
             return Err(exception);
         }
 
@@ -214,23 +214,36 @@ impl StreamItem {
                 return Err(());
             }
         };
-
+		let hash: String = match json_object.get("hash") {
+            Some(v) =>match v{
+            		&json::JsonValue::String(ref value)=>value.clone(),
+            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
+            		_=>{
+            			println!("line 223 parsing error!");
+	                    return Err(());
+            		}
+            	},
+            None => {
+            	println!("line 228 parsing error!");
+                return Err(());
+            }
+        };
         let text = match json_object.get("value") {
             Some(v) => match v{
             		&json::JsonValue::String(ref value)=>value.clone(),
             		&json::JsonValue::Short(value) =>value.as_str().to_string(),
             		_=>{
-            			println!("line 226 parsing error!");
+            			println!("line 237 parsing error!");
 	                    return Err(());
             		}
             	},
             None => {
-            	println!("line 231 parsing error!");
+            	println!("line 242 parsing error!");
                 return Err(());
             }
         };
         let chat_type = match type_string.as_str() {
-            "TEXT" => ChatMessageType::Text { text: text },
+            "TEXT" => ChatMessageType::Text { text: text, hash:hash },
             "IMG" => ChatMessageType::Image { bytes: Arc::new(Vec::new()) },
             "FILE" => ChatMessageType::File { bytes: Arc::new(Vec::new()) },
 			"EXIT" =>{
@@ -245,7 +258,7 @@ impl StreamItem {
             }
         };
         // TODO:여기서 메시지를 조립하여 반환한다.
-        return Ok(ChatMessage::new(self.uid, room, chat_type));
+        return Ok(ChatMessage::new(self.uid,room, chat_type));
     }
 }
 
@@ -618,7 +631,7 @@ fn main() {
                         }
                     }
                     let msg = Arc::new(msg);
-					
+					let now_time = UTC::now();
                     for item in sockets {
                         let socket = item.clone();
                         let msg = msg.clone();
@@ -631,6 +644,7 @@ fn main() {
                         else{
                         	continue;
                         };
+                        let now_time = now_time.to_rfc2822();
                         thread::spawn(move || {
                             let socket = socket.lock();
                             if let Err(_) = socket {
@@ -639,13 +653,14 @@ fn main() {
                             let mut socket = socket.unwrap();
 
                             let json_object = match msg.message_type {
-                                ChatMessageType::Text { ref text } => {
+                                ChatMessageType::Text { ref text, ref hash } => {
                                     object!
                                     {
                                     	"type"=>"CHAT_SEND",
                                         "sender"=>name.clone(),
+                                        "sender hash"=>hash.clone(),
                                         "text"=>text.clone(),
-                                        "time"=>format!("{}",UTC::now()),
+                                        "time"=>now_time,
                                         "room"=>msg.room.clone()
                                     }
                                 },
@@ -672,7 +687,7 @@ fn main() {
                                     {
                                         "sender"=>name.clone(),
                                         "text"=>"",
-                                        "time"=>format!("{}",UTC::now()),
+                                        "time"=>now_time,
                                         "room"=>""
                                     }
                                 }
