@@ -15,6 +15,20 @@ use std::time::Duration;
 use std::io::{Error, ErrorKind, Read, Write};
 use std::io;
 use std::collections::BTreeMap;
+
+fn json_object_get_string(object:&json::object::Object, key:&str)->Result<String, ()>{
+    return match object.get(key){
+        Some(v)=>
+            match v{
+                &json::JsonValue::String(ref value)=>Ok(value.clone()),
+                &json::JsonValue::Short(value) =>Ok(value.as_str().to_string()),
+                _=>Err(())
+            },
+        None=>Err(())
+    };
+}
+
+
 enum CommandType {
     ChangeName {
         new_name: String,
@@ -198,62 +212,22 @@ impl StreamItem {
                 return Err(());
             }
         };
-        let type_string: String = match json_object.get("type") {
-            Some(v) =>match v{
-            		&json::JsonValue::String(ref value)=>value.clone(),
-            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
-            		_=>{
-            			println!("line 196 parsing error!");
-	                    return Err(());
-            		}
-            	},
-            None => {
-            	println!("line 200 parsing error!");
-                return Err(());
-            }
+        let type_string: String =match json_object_get_string(json_object,"type"){
+            Ok(v)=>v,
+            Err(_)=>return Err(())
         };
 
-        let room: String = match json_object.get("room") {
-            Some(v) =>match v{
-            		&json::JsonValue::String(ref value)=>value.clone(),
-            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
-            		_=>{
-            			println!("line 211 parsing error!");
-	                    return Err(());
-            		}
-            	},
-            None => {
-            	println!("line 216 parsing error!");
-                return Err(());
-            }
+        let room: String =match json_object_get_string(json_object,"room"){
+            Ok(v)=>v,
+            Err(_)=>return Err(())
         };
-		let hash: String = match json_object.get("hash") {
-            Some(v) =>match v{
-            		&json::JsonValue::String(ref value)=>value.clone(),
-            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
-            		_=>{
-            			println!("line 223 parsing error!");
-	                    return Err(());
-            		}
-            	},
-            None => {
-            	println!("line 228 parsing error!");
-                return Err(());
-            }
+		let hash: String = match json_object_get_string(json_object,"hash"){
+            Ok(v)=>v,
+            Err(_)=>return Err(())
         };
-        let text = match json_object.get("value") {
-            Some(v) => match v{
-            		&json::JsonValue::String(ref value)=>value.clone(),
-            		&json::JsonValue::Short(value) =>value.as_str().to_string(),
-            		_=>{
-            			println!("line 237 parsing error!");
-	                    return Err(());
-            		}
-            	},
-            None => {
-            	println!("line 242 parsing error!");
-                return Err(());
-            }
+        let text = match json_object_get_string(json_object,"value"){
+            Ok(v)=>v,
+            Err(_)=>return Err(())
         };
         let chat_type = match type_string.as_str() {
             "TEXT" => ChatMessageType::Text { text: text, hash:hash },
@@ -631,11 +605,10 @@ fn main() {
                             let mut index = None;
                             if let Some(mut room) = rooms.get_mut(&msg.room) {
                                 for i in 0..room.entered_user_uids.len() {
-                                    if let Some(value) = room.entered_user_uids.get(i) {
-                                        if value == uid {
-                                            index = Some(i);
-                                            break;
-                                        }
+                                    let value = room.entered_user_uids.get(i).unwrap();
+                                    if value == uid {
+                                        index = Some(i);
+                                        break;
                                     }
                                 }
                                 if let Some(idx) = index {
